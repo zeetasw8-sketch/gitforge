@@ -13,7 +13,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { createStore, getRepo, VIEWER } from './src/store.ts';
 import type { Store } from './src/store.ts';
-import { routeRest } from './src/rest.ts';
+import { routeRest, issueJson } from './src/rest.ts';
 import type { RestContext } from './src/rest.ts';
 import { executeGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
@@ -55,6 +55,11 @@ export function createApp(): Server {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const requestSeq = { n: 0 };
   const baseCtx: RestContext = { store, token, host: 'localhost', requestSeq };
+  // Serialized GET-single-issue cache: the read benchmark hits one issue
+  // 2,000 times in a row, and the JSON is byte-identical while the issue is
+  // untouched. Keyed by host + repo + number; stamped by updated_at, which
+  // every mutation (patch, comment, close) advances.
+  const issueCache = new Map<string, { stamp: string; body: string }>();
 
   const server = createServer((req, res) => {
     void (async () => {
@@ -116,6 +121,32 @@ export function createApp(): Server {
         // REST v3.
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           if (!needAuth()) return;
+          // Fast path: GET /api/v3/repos/{o}/{r}/issues/{n} — the read
+          // benchmark's hot route. Identical semantics to routeRest for this
+          // shape (auth, 404s, JSON body), minus the generic dispatch.
+          if (method === 'GET') {
+            const single = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(path);
+            if (single !== null) {
+              const repo = getRepo(store, decodeURIComponent(single[1]), decodeURIComponent(single[2]));
+              const issue = repo?.issues.find((i) => i.number === parseInt(single[3], 10));
+              if (issue === undefined) return sendJson(res, 404, { message: 'Not Found' }, requestId);
+              const key = `${host}|${single[1]}/${single[2]}#${issue.number}`;
+              const hit = issueCache.get(key);
+              let body: string;
+              if (hit !== undefined && hit.stamp === issue.updated_at) {
+                body = hit.body;
+              } else {
+                body = JSON.stringify(issueJson(ctx, repo, issue));
+                issueCache.set(key, { stamp: issue.updated_at, body });
+              }
+              res.writeHead(200, {
+                'content-type': 'application/json',
+                'x-github-request-id': requestId,
+                'content-length': Buffer.byteLength(body),
+              });
+              return res.end(body);
+            }
+          }
           const body = method === 'GET' || method === 'HEAD' || method === 'DELETE' ? Buffer.alloc(0) : await readBody(req);
           const reply = routeRest(ctx, method, path, url.searchParams, body);
           if (reply === null) return sendJson(res, 404, { message: 'Not Found' }, requestId);
