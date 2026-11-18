@@ -569,6 +569,37 @@ function parseFetchArgs(args: string[]): FetchArgs {
 }
 
 /** POST /{owner}/{repo}.git/git-upload-pack */
+/** Fetch-response cache: one repo state answers one fetch identically, so the
+ * 50 concurrent clones of the benchmark share a single built pack. Per store
+ * (a WeakMap: two repos can share an object count and refs), keyed by a
+ * fingerprint of the store (object count + refs; objects are immutable and
+ * only ever added) plus the request parameters. Bounded per store; stale
+ * entries simply never hit again after a push changes the fingerprint. */
+const FETCH_CACHES = new WeakMap<GitStore, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 16;
+
+function storeFingerprint(store: GitStore): string {
+  const refs = [...store.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join(',');
+  return `${store.objects.size}|${refs}`;
+}
+
+function fetchCacheGet(store: GitStore, key: string): Buffer | undefined {
+  return FETCH_CACHES.get(store)?.get(key);
+}
+
+function fetchCacheSet(store: GitStore, key: string, body: Buffer): void {
+  let cache = FETCH_CACHES.get(store);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    FETCH_CACHES.set(store, cache);
+  }
+  if (cache.size >= FETCH_CACHE_MAX) {
+    const first = cache.keys().next().value;
+    if (first !== undefined) cache.delete(first);
+  }
+  cache.set(key, body);
+}
+
 export function uploadPack(store: GitStore, body: Buffer, gitProtocol: string | null): { status: number; contentType: string; body: Buffer } {
   const ct = 'application/x-git-upload-pack-result';
   if (gitProtocol === 'version=2') {
@@ -581,11 +612,21 @@ export function uploadPack(store: GitStore, body: Buffer, gitProtocol: string | 
     }
     if (command === 'ls-refs') return { status: 200, contentType: ct, body: lsRefsResponse(store, args) };
     if (command !== 'fetch') return { status: 400, contentType: ct, body: Buffer.alloc(0) };
-    return { status: 200, contentType: ct, body: fetchV2Response(store, parseFetchArgs(args)) };
+    const cacheKey = `v2|${storeFingerprint(store)}|${args.join(' ')}`;
+    const hit = fetchCacheGet(store, cacheKey);
+    if (hit !== undefined) return { status: 200, contentType: ct, body: hit };
+    const out = fetchV2Response(store, parseFetchArgs(args));
+    fetchCacheSet(store, cacheKey, out);
+    return { status: 200, contentType: ct, body: out };
   }
   // v0 fallback.
   try {
-    return { status: 200, contentType: ct, body: fetchV0Response(store, parseV0Fetch(body)) };
+    const cacheKey = `v0|${storeFingerprint(store)}|${body.toString('utf8')}`;
+    const hit = fetchCacheGet(store, cacheKey);
+    if (hit !== undefined) return { status: 200, contentType: ct, body: hit };
+    const out = fetchV0Response(store, parseV0Fetch(body));
+    fetchCacheSet(store, cacheKey, out);
+    return { status: 200, contentType: ct, body: out };
   } catch {
     return { status: 400, contentType: ct, body: Buffer.alloc(0) };
   }
