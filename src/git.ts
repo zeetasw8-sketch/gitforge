@@ -384,19 +384,51 @@ export function collectClosure(store: GitStore, wants: readonly string[], opts: 
       for (const e of parseTree(obj.data)) exQueue.push(e.oid);
     }
   }
-  // Walk wants up to depth, skipping excluded commits.
+  // Walk wants up to depth, skipping excluded commits. Non-commit wants
+  // (annotated tags) are sent as-is and traversed via their peeled commit.
+  // A want that is both a have and a shallow boundary is a deepen request:
+  // the client holds the tip and asks for the history behind it, so it seeds
+  // the walk (at gen 0, never itself sent) instead of being filtered out.
+  const extraWants: string[] = [];
+  const commitWants: string[] = [];
+  for (const w of wants) {
+    const obj = store.objects.get(w);
+    if (obj === undefined) continue;
+    if (obj.type === 'commit') {
+      commitWants.push(w);
+      continue;
+    }
+    if (obj.type === 'tag') {
+      extraWants.push(w);
+      const target = peelToCommit(store, w);
+      if (target !== w && store.objects.get(target)?.type === 'commit') commitWants.push(target);
+      continue;
+    }
+    extraWants.push(w);
+  }
   const commits = new Map<string, number>();
-  const queue: Array<{ oid: string; gen: number }> = wants.filter((w) => store.objects.has(w) && !excluded.has(w)).map((oid) => ({ oid, gen: 0 }));
+  const queue: Array<{ oid: string; gen: number }> = [];
+  for (const oid of commitWants) {
+    if (excluded.has(oid) && !(depth !== undefined && shallow.has(oid))) continue;
+    queue.push({ oid, gen: 0 });
+  }
   const boundary = new Set<string>();
   while (queue.length) {
     const { oid, gen } = queue.shift()!;
     if (commits.has(oid)) continue;
     const obj = store.objects.get(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
-    commits.set(oid, gen);
-    if (depth !== undefined && gen >= depth - 1) { boundary.add(oid); continue; }
+    if (excluded.has(oid)) {
+      // A held root (deepen): never sent, but the history behind it is the
+      // answer — traverse its parents unless the depth cutoff is reached.
+      if (depth !== undefined && gen >= depth - 1) continue;
+    } else {
+      commits.set(oid, gen);
+      if (depth !== undefined && gen >= depth - 1) { boundary.add(oid); continue; }
+    }
     for (const p of parseCommit(obj.data).parents) {
-      if (!excluded.has(p) && !commits.has(p)) queue.push({ oid: p, gen: gen + 1 });
+      if (commits.has(p)) continue;
+      if (!excluded.has(p) || (depth !== undefined && shallow.has(p))) queue.push({ oid: p, gen: gen + 1 });
     }
   }
   // Gather trees + blobs reachable from the included commits, minus excluded objects.
@@ -415,6 +447,7 @@ export function collectClosure(store: GitStore, wants: readonly string[], opts: 
     }
   };
   for (const oid of commits.keys()) addObject(oid);
+  for (const oid of extraWants) addObject(oid);
   return { commits, objects, boundary: [...boundary] };
 }
 
