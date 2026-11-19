@@ -501,14 +501,48 @@ function sideband(pack: Buffer): Buffer {
 }
 
 /** GET /{owner}/{repo}.git/info/refs?service=<service> */
+/** Unified per-store response cache for deterministic git responses (info/refs
+ * advertisement, ls-refs, fetch): one repo state answers one request
+ * identically, so the 50 concurrent clones of the benchmark share a single
+ * built response. Keyed by a fingerprint of the store (object count + refs;
+ * objects are immutable and only ever added) plus the request identity.
+ * Bounded per store; stale entries simply never hit again after a push
+ * changes the fingerprint. */
+const RESPONSE_CACHES = new WeakMap<GitStore, Map<string, Buffer>>();
+const RESPONSE_CACHE_MAX = 32;
+
+function responseCacheGet(store: GitStore, key: string): Buffer | undefined {
+  return RESPONSE_CACHES.get(store)?.get(key);
+}
+
+function responseCacheSet(store: GitStore, key: string, body: Buffer): void {
+  let cache = RESPONSE_CACHES.get(store);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    RESPONSE_CACHES.set(store, cache);
+  }
+  if (cache.size >= RESPONSE_CACHE_MAX) {
+    const first = cache.keys().next().value;
+    if (first !== undefined) cache.delete(first);
+  }
+  cache.set(key, body);
+}
+
 export function infoRefs(store: GitStore, defaultBranch: string, service: 'git-upload-pack' | 'git-receive-pack', gitProtocol: string | null): { status: number; contentType: string; body: Buffer } {
   const ct = `application/x-${service}-advertisement`;
+  // Cache the advertisement: identical for a given repo state + service +
+  // protocol, and every clone issues one info/refs request.
+  const cacheKey = `info|${storeFingerprint(store)}|${service}|${gitProtocol ?? ''}`;
+  const hit = responseCacheGet(store, cacheKey);
+  if (hit !== undefined) return { status: 200, contentType: ct, body: hit };
   const refs = listRefs(store, defaultBranch);
   if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
     const lines = [pktLine('# service=git-upload-pack\n'), pktFlush(), pktLine('version 2\n')];
     for (const cap of V2_CAPS) lines.push(pktLine(`${cap}\n`));
     lines.push(pktFlush());
-    return { status: 200, contentType: ct, body: Buffer.concat(lines) };
+    const body = Buffer.concat(lines);
+    responseCacheSet(store, cacheKey, body);
+    return { status: 200, contentType: ct, body };
   }
   const lines = [pktLine(`# service=${service}\n`), pktFlush()];
   const caps = service === 'git-upload-pack' ? V0_UPLOAD_CAPS : V0_RECEIVE_CAPS;
@@ -524,7 +558,9 @@ export function infoRefs(store: GitStore, defaultBranch: string, service: 'git-u
     if (ref.peeled !== undefined) lines.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
   }
   lines.push(pktFlush());
-  return { status: 200, contentType: ct, body: Buffer.concat(lines) };
+  const body = Buffer.concat(lines);
+  responseCacheSet(store, cacheKey, body);
+  return { status: 200, contentType: ct, body };
 }
 
 interface FetchArgs {
@@ -569,39 +605,23 @@ function parseFetchArgs(args: string[]): FetchArgs {
 }
 
 /** POST /{owner}/{repo}.git/git-upload-pack */
-/** Fetch-response cache: one repo state answers one fetch identically, so the
- * 50 concurrent clones of the benchmark share a single built pack. Per store
- * (a WeakMap: two repos can share an object count and refs), keyed by a
- * fingerprint of the store (object count + refs; objects are immutable and
- * only ever added) plus the request parameters. Bounded per store; stale
- * entries simply never hit again after a push changes the fingerprint. */
-const FETCH_CACHES = new WeakMap<GitStore, Map<string, Buffer>>();
-const FETCH_CACHE_MAX = 16;
-
 function storeFingerprint(store: GitStore): string {
   const refs = [...store.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join(',');
   return `${store.objects.size}|${refs}`;
 }
 
-function fetchCacheGet(store: GitStore, key: string): Buffer | undefined {
-  return FETCH_CACHES.get(store)?.get(key);
-}
-
-function fetchCacheSet(store: GitStore, key: string, body: Buffer): void {
-  let cache = FETCH_CACHES.get(store);
-  if (cache === undefined) {
-    cache = new Map<string, Buffer>();
-    FETCH_CACHES.set(store, cache);
-  }
-  if (cache.size >= FETCH_CACHE_MAX) {
-    const first = cache.keys().next().value;
-    if (first !== undefined) cache.delete(first);
-  }
-  cache.set(key, body);
-}
-
 export function uploadPack(store: GitStore, body: Buffer, gitProtocol: string | null): { status: number; contentType: string; body: Buffer } {
   const ct = 'application/x-git-upload-pack-result';
+  // Cache on the raw request body + store fingerprint, checked BEFORE parsing:
+  // the body uniquely identifies the command and its arguments, so a hit
+  // skips parseV2Request/parseV0Fetch entirely. Covers ls-refs (previously
+  // uncached) and fetch. A push changes the fingerprint, so stale entries
+  // simply never hit again.
+  const bodyStr = body.toString('utf8');
+  const cacheKey = `${gitProtocol === 'version=2' ? 'up2' : 'up0'}|${storeFingerprint(store)}|${bodyStr}`;
+  const hit = responseCacheGet(store, cacheKey);
+  if (hit !== undefined) return { status: 200, contentType: ct, body: hit };
+  let out: Buffer;
   if (gitProtocol === 'version=2') {
     let command: string;
     let args: string[];
@@ -610,26 +630,19 @@ export function uploadPack(store: GitStore, body: Buffer, gitProtocol: string | 
     } catch {
       return { status: 400, contentType: ct, body: Buffer.alloc(0) };
     }
-    if (command === 'ls-refs') return { status: 200, contentType: ct, body: lsRefsResponse(store, args) };
-    if (command !== 'fetch') return { status: 400, contentType: ct, body: Buffer.alloc(0) };
-    const cacheKey = `v2|${storeFingerprint(store)}|${args.join(' ')}`;
-    const hit = fetchCacheGet(store, cacheKey);
-    if (hit !== undefined) return { status: 200, contentType: ct, body: hit };
-    const out = fetchV2Response(store, parseFetchArgs(args));
-    fetchCacheSet(store, cacheKey, out);
-    return { status: 200, contentType: ct, body: out };
+    if (command === 'ls-refs') out = lsRefsResponse(store, args);
+    else if (command === 'fetch') out = fetchV2Response(store, parseFetchArgs(args));
+    else return { status: 400, contentType: ct, body: Buffer.alloc(0) };
+  } else {
+    // v0 fallback.
+    try {
+      out = fetchV0Response(store, parseV0Fetch(body));
+    } catch {
+      return { status: 400, contentType: ct, body: Buffer.alloc(0) };
+    }
   }
-  // v0 fallback.
-  try {
-    const cacheKey = `v0|${storeFingerprint(store)}|${body.toString('utf8')}`;
-    const hit = fetchCacheGet(store, cacheKey);
-    if (hit !== undefined) return { status: 200, contentType: ct, body: hit };
-    const out = fetchV0Response(store, parseV0Fetch(body));
-    fetchCacheSet(store, cacheKey, out);
-    return { status: 200, contentType: ct, body: out };
-  } catch {
-    return { status: 400, contentType: ct, body: Buffer.alloc(0) };
-  }
+  responseCacheSet(store, cacheKey, out);
+  return { status: 200, contentType: ct, body: out };
 }
 
 function lsRefsResponse(store: GitStore, args: string[]): Buffer {

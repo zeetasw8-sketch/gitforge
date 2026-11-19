@@ -13,7 +13,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { createStore, getRepo, VIEWER } from './src/store.ts';
 import type { Store } from './src/store.ts';
-import { routeRest, issueJson } from './src/rest.ts';
+import { routeRest, issueJson, createIssueFast } from './src/rest.ts';
 import type { RestContext } from './src/rest.ts';
 import { executeGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
@@ -148,6 +148,27 @@ export function createApp(): Server {
             }
           }
           const body = method === 'GET' || method === 'HEAD' || method === 'DELETE' ? Buffer.alloc(0) : await readBody(req);
+          // Fast path: POST /api/v3/repos/{o}/{r}/issues — the write
+          // benchmark's hot route. Identical semantics to routeRest for this
+          // shape (auth, 404s, JSON body), minus the generic dispatch. Falls
+          // through to routeRest on any input createIssueFast declines.
+          if (method === 'POST') {
+            const create = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(path);
+            if (create !== null) {
+              const repo = getRepo(store, decodeURIComponent(create[1]), decodeURIComponent(create[2]));
+              if (repo !== undefined) {
+                const fast = createIssueFast(ctx, repo, body);
+                if (fast !== null) {
+                  res.writeHead(fast.status, {
+                    'content-type': 'application/json',
+                    'x-github-request-id': requestId,
+                    'content-length': Buffer.byteLength(fast.body),
+                  });
+                  return res.end(fast.body);
+                }
+              }
+            }
+          }
           const reply = routeRest(ctx, method, path, url.searchParams, body);
           if (reply === null) return sendJson(res, 404, { message: 'Not Found' }, requestId);
           if (reply.noBody || reply.status === 204) {

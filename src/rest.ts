@@ -22,12 +22,27 @@ export interface RestReply {
 
 const NOT_FOUND = { message: 'Not Found' };
 
-function userJson(login: string, id: number): Record<string, unknown> {
-  return { login, id, node_id: nodeId('User', id), avatar_url: '', gravatar_id: '', url: '', html_url: '', type: 'User', site_admin: false };
+/** node_id values are pure functions of (kind, id) and never change; the
+ * base64 encode + Buffer alloc per call is pure waste on hot routes. */
+const nodeIdCache = new Map<string, string>();
+export function nodeId(kind: string, id: number): string {
+  const key = `${kind}:${id}`;
+  const hit = nodeIdCache.get(key);
+  if (hit !== undefined) return hit;
+  const value = Buffer.from(key).toString('base64');
+  nodeIdCache.set(key, value);
+  return value;
 }
 
-export function nodeId(kind: string, id: number): string {
-  return Buffer.from(`${kind}:${id}`).toString('base64');
+/** The viewer user object is constant; cache user JSON by login:id. */
+const userJsonCache = new Map<string, Record<string, unknown>>();
+function userJson(login: string, id: number): Record<string, unknown> {
+  const key = `${login}:${id}`;
+  const hit = userJsonCache.get(key);
+  if (hit !== undefined) return hit;
+  const value = { login, id, node_id: nodeId('User', id), avatar_url: '', gravatar_id: '', url: '', html_url: '', type: 'User', site_admin: false };
+  userJsonCache.set(key, value);
+  return value;
 }
 
 export function repoJson(ctx: RestContext, repo: Repo): Record<string, unknown> {
@@ -586,6 +601,26 @@ export function createIssueRecord(ctx: RestContext, repo: Repo, title: string, b
   };
   repo.issues.push(issue);
   return { issue };
+}
+
+/**
+ * Fast path for POST /api/v3/repos/{o}/{r}/issues (the write benchmark's hot
+ * route): same semantics as routeRest for this shape, but returns the
+ * pre-serialized JSON string so the caller can skip the generic dispatch and
+ * the object->JSON round trip. Returns null on any input the generic route
+ * must answer itself (bad JSON, missing title, unknown label) so the caller
+ * falls through to routeRest and the exact error is preserved.
+ */
+export function createIssueFast(ctx: RestContext, repo: Repo, rawBody: Buffer): { status: number; body: string } | null {
+  const parsed = parseBody(rawBody);
+  if (!parsed.ok) return null;
+  const body = parsed.value ?? {};
+  const title = str(body.title);
+  if (title === '') return null;
+  const labelNames: string[] = Array.isArray(body.labels) ? body.labels.filter((l): l is string => typeof l === 'string') : [];
+  const created = createIssueRecord(ctx, repo, title, str(body.body), labelNames);
+  if ('error' in created) return null;
+  return { status: 201, body: JSON.stringify(issueJson(ctx, repo, created.issue)) };
 }
 
 /** Shared pull-request creation (REST and MCP call this). */
